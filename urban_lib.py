@@ -8,6 +8,8 @@ import pandas as pd
 import numpy as np
 import osmnx as ox
 from shapely.geometry import Polygon
+from geopy import distance
+from collections import defaultdict
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -28,7 +30,22 @@ class Uber_movement_data:
         """Auxilary function to turn a row of data into pd.datetime"""
         return pd.to_datetime('{}/{}/{}'.format(int(row['year']), int(row['month']), int(row['day'])))
     
-    def load_from_file(self, years_months, area_verts = None, node_ids = [], path = ''):
+    def _streets_from_verts(self, area_verts):
+        """Auxilary function"""
+        if area_verts is not None:
+            area = Polygon(area_verts)
+            self.streets = ox.core.osm_net_download(polygon = area,
+                                                    network_type = 'all_private')[0]['elements']
+            
+    def node_coords_from_area(self, node_ids = None):
+        """Auxilary function to get latitudes and longitudes of nodes
+        In odrer to use it, one needs to pass area_verts first"""
+        self.nodecoords = {}
+        for row in self.streets:
+            if row['type'] == 'node' and (node_ids is None or row['id'] in node_ids):
+                self.nodecoords[row['id']] = (row['lat'], row['lon'])
+    
+    def load_from_file(self, years_months, area_verts = None, node_ids = None, path = ''):
         """
         Function that loads Uber mobility data from specific area.
         
@@ -36,17 +53,17 @@ class Uber_movement_data:
         years_months - list of tuples (year, month) that are of interest
         area_verts - list of verticles (lon, lat) of area we are interested in
         node_ids - list of OpenStreetMap node ids. if area_verts is None, 
-        we use node_ids instead. area_verts and node_ids cannot both be empty
+        we use node_ids instead. area_verts and node_ids cannot both be None
         path - path to the folder, where .csv file is located
         """
         
-        if area_verts is None and len(node_ids) == 0:
-            raise ValueError("area_verts and node_ids cannot both be empty")
+        if area_verts is None and node_ids is None:
+            raise ValueError("area_verts and node_ids cannot both be None")
         
         if area_verts is not None:
-            area = Polygon(area_verts)
-            streets = ox.core.osm_net_download(polygon = area, network_type = 'all_private')[0]['elements']
-            for row in streets:
+            node_ids = []
+            self._streets_from_verts(area_verts)
+            for row in self.streets:
                 if row['type'] == 'node':
                     node_ids.append(row['id'])
                     
@@ -63,23 +80,43 @@ class Uber_movement_data:
                     tp.append(filtered_chunk)
 
         self.data = pd.concat(tp)
-        self.data.sort_values(by = ['date'], inplace = True)
+        self.data.sort_values(by = ['date', 'hour'], inplace = True)
         del(tp)
         
     def save_data_to_file(self, path):
         """Method to save already filtered data to .csv file"""
-        self.data.to_csv(path)
+        self.data.to_csv(path, index = False)
         
-    def load_filtered_from_file(self, path):
+    def load_filtered_from_file(self, path, area_verts = None):
         """Method to load already filtered data from .csv file"""
         tp = []
-        for chunk in pd.read_csv(path, dtype = _dtypes, parse_dates = ['date'],
+        self._streets_from_verts(area_verts)
+            
+        for chunk in pd.read_csv(path, dtype = self._dtypes, parse_dates = ['date'],
                                  chunksize = 100000, low_memory = False):
             tp.append(chunk)
 
         self.data = pd.concat(tp)
- 
- 
+    
+    def avg_speed_from_ids(self, id_list):
+        """Return average speeds computed over the path given by id_list"""
+        adj_node_pairs = [(id_, id_list[i + 1]) for i, id_ in enumerate(id_list[:-1])]
+        dists = {pair: distance.distance(self.nodecoords[pair[0]],
+                                         self.nodecoords[pair[1]]).km for pair in adj_node_pairs}
+        total_dists, total_times = defaultdict(int), defaultdict(int)
+        for _, row in self.data.iterrows():
+            node_pair = (row['osm_start_node_id'], row['osm_end_node_id'])
+            if node_pair in adj_node_pairs:
+                total_dists[(row['date'], row['hour'])] += dists[node_pair]
+                total_times[(row['date'], row['hour'])] += dists[node_pair]\
+                                                           / row['speed_kph_mean']
+        
+        ave_speeds = {}
+        for datetime_key, total_dist in total_dists.items():
+            ave_speeds[datetime_key] = total_dist / total_times[datetime_key]
+        return ave_speeds
+
+
 class Visualizer:
     """
     Frequently needed utilities for visualization here
@@ -105,6 +142,7 @@ class Visualizer:
         colors - colors of graphs, must be same size as data_list
         window - window of rolling average. If 0, a graph without averaging 
         is built. If type of y is datetime, widow must be timedelta
+        stds - list of standart deviations, must be same size as data_list
         """
         if stds is None:
             stds = [0] * len(data_list)
